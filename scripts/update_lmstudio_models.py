@@ -15,10 +15,10 @@ update_lmstudio_models.py
   * loaded_instances -> кэшируются значения loaded_instances[i].config.context_length
     по ключу loaded_instances[i].id (в кеше они привязаны к подключению)
   * models -> у каждой модели берётся max_context_length как запасной вариант
-- Обновляет в конфиге opencode.json список моделей у каждого подключения
-  типа lmstudio, указывая для каждой модели поле `context_size`. В качестве
-  значения сначала ищется кэшированное значение (или значение из текущего
-  ответа loaded_instances), иначе подставляется max_context_length.
+ - Обновляет в конфиге opencode.json список моделей у каждого подключения
+  типа lmstudio: для каждой модели записывается поле `limit.context` (значение
+  сначала ищется в кеше/loaded_instances, иначе используется max_context_length).
+  Также инициализируется `limit.output = 0`, если отсутствует.
 
 Пример использования:
   ./scripts/update_lmstudio_models.py
@@ -382,20 +382,44 @@ def get_model_id_from_entry(entry: Any) -> Optional[str]:
     return None
 
 
-def get_context_for_model(connection_key: str, model_id: str, server_models: Dict[str, int], cache: Dict[str, Dict[str, int]]) -> Optional[int]:
-    # 1) exact cache match
-    if connection_key in cache and model_id in cache[connection_key]:
-        return cache[connection_key][model_id]
+def get_context_for_model(
+    connection_key: str,
+    model_id: str,
+    server_models: Dict[str, int],
+    cache: Dict[str, Dict[str, int]],
+    loaded_instances: Optional[Dict[str, int]] = None,
+) -> Optional[int]:
+    """Return context size with priority:
+    1) loaded_instances (from REST response)
+    2) cache
+    3) server_models (max_context_length)
+    The function performs exact match first and then fuzzy matches (startswith / contains).
+    """
+    # 1) check loaded_instances (REST) first
+    if isinstance(loaded_instances, dict):
+        # exact match
+        if model_id in loaded_instances:
+            return loaded_instances[model_id]
+        # fuzzy matches
+        for inst_id, ctx in loaded_instances.items():
+            if inst_id == model_id:
+                return ctx
+            if inst_id.startswith(model_id):
+                return ctx
+            if model_id in inst_id:
+                return ctx
 
-    # 2) try to match cache keys by prefix or substring
-    if connection_key in cache:
+    # 2) check cache
+    if connection_key in cache and isinstance(cache[connection_key], dict):
+        # exact match
+        if model_id in cache[connection_key]:
+            return cache[connection_key][model_id]
+        # fuzzy matches
         for inst_id, ctx in cache[connection_key].items():
             if inst_id == model_id:
                 return ctx
-            # common pattern: instance id starts with model_id
             if inst_id.startswith(model_id):
                 return ctx
-            # or model_id contained in inst_id
             if model_id in inst_id:
                 return ctx
 
@@ -432,6 +456,33 @@ def update_connection_models(
     # current models in connection
     models_obj = conn.get("models")
 
+    # Ensure we don't leave or write legacy context keys into the config.
+    banned_keys = {
+        "context_window",
+        "contextWindow",
+        "context_size",
+        "context-size",
+        "contextLength",
+        "context_length",
+    }
+    if isinstance(models_obj, list):
+        for entry in models_obj:
+            if isinstance(entry, dict):
+                mid = get_model_id_from_entry(entry) or "<unknown>"
+                for bk in list(banned_keys):
+                    if bk in entry:
+                        entry.pop(bk, None)
+                        changed = True
+                        messages.append(f"models: removed {mid}.{bk}")
+    elif isinstance(models_obj, dict):
+        for mid, info in list(models_obj.items()):
+            if isinstance(info, dict):
+                for bk in list(banned_keys):
+                    if bk in info:
+                        info.pop(bk, None)
+                        changed = True
+                        messages.append(f"models[{mid}]: removed {bk}")
+
     # Build existing map: model_id -> (entry, index) for lists
     if isinstance(models_obj, list):
         existing_map: Dict[str, Tuple[Any, int]] = {}
@@ -442,63 +493,91 @@ def update_connection_models(
 
         # Update existing entries
         for mid, (entry, idx) in list(existing_map.items()):
-            ctx = get_context_for_model(connection_key, mid, server_models, cache)
+            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
             if ctx is not None:
-                # if entry is string, replace with dict
+                # if entry is string, replace with dict; ensure limit/context/output are set
                 if isinstance(entry, str):
-                    conn["models"][idx] = {"id": mid, "context_size": ctx}
+                    # replace string entry with dict containing only limit
+                    new_entry: Dict[str, Any] = {"id": mid, "limit": {"context": ctx, "output": 0}}
+                    conn["models"][idx] = new_entry
                     changed = True
-                    messages.append(f"models: set {mid}.context_size={ctx}")
+                    messages.append(f"models: set {mid}.limit.context={ctx}")
+                    messages.append(f"models: set {mid}.limit.output=0")
                 elif isinstance(entry, dict):
-                    if entry.get("context_size") != ctx:
-                        entry["context_size"] = ctx
+                    # update legacy context_size if needed
+                    # ensure limit dict exists and has context/output
+                    lim = entry.setdefault("limit", {})
+                    if lim.get("context") != ctx:
+                        lim["context"] = ctx
                         changed = True
-                        messages.append(f"models: set {mid}.context_size={ctx}")
+                        messages.append(f"models: set {mid}.limit.context={ctx}")
+                    if "output" not in lim:
+                        lim["output"] = 0
+                        changed = True
+                        messages.append(f"models: set {mid}.limit.output=0")
 
         # Add missing server models that are not present in config
         for mid, maxctx in server_models.items():
             if mid in existing_map:
                 continue
-            ctx = get_context_for_model(connection_key, mid, server_models, cache)
-            entry = {"id": mid}
+            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
+            entry: Dict[str, Any] = {"id": mid}
+            # set limit (do not write legacy context_size)
             if ctx is not None:
-                entry["context_size"] = ctx
+                entry["limit"] = {"context": ctx, "output": 0}
+            else:
+                # still initialize limit.output
+                entry["limit"] = {"output": 0}
             conn.setdefault("models", []).append(entry)
             changed = True
-            messages.append(f"models: add {mid} context_size={ctx}")
+            messages.append(f"models: add {mid} limit.context={ctx}")
+            messages.append(f"models: add {mid} limit.output=0")
 
     elif isinstance(models_obj, dict):
         # keys are model ids
         for mid, info in models_obj.items():
-            ctx = get_context_for_model(connection_key, mid, server_models, cache)
+            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
             if ctx is not None:
                 if not isinstance(info, dict):
-                    models_obj[mid] = {"context_size": ctx}
+                    # replace non-dict entry with dict containing only limit
+                    models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
                     changed = True
-                    messages.append(f"models[{mid}] = {{context_size: {ctx}}}")
+                    messages.append(f"models[{mid}].limit.context={ctx}")
+                    messages.append(f"models[{mid}].limit.output=0")
                 else:
-                    if info.get("context_size") != ctx:
-                        info["context_size"] = ctx
+                    lim = info.setdefault("limit", {})
+                    if lim.get("context") != ctx:
+                        lim["context"] = ctx
                         changed = True
-                        messages.append(f"models[{mid}].context_size={ctx}")
+                        messages.append(f"models[{mid}].limit.context={ctx}")
+                    if "output" not in lim:
+                        lim["output"] = 0
+                        changed = True
+                        messages.append(f"models[{mid}].limit.output=0")
 
         # add missing server models
         for mid, maxctx in server_models.items():
             if mid in models_obj:
                 continue
-            ctx = get_context_for_model(connection_key, mid, server_models, cache)
-            models_obj[mid] = {"context_size": ctx} if ctx is not None else {}
+            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
+            if ctx is not None:
+                models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
+            else:
+                models_obj[mid] = {"limit": {"output": 0}}
             changed = True
-            messages.append(f"models: add {mid} context_size={ctx}")
+            messages.append(f"models: add {mid} limit.context={ctx}")
+            messages.append(f"models: add {mid} limit.output=0")
 
     else:
         # no models defined, create list from server_models
         new_models = []
         for mid, maxctx in server_models.items():
-            ctx = get_context_for_model(connection_key, mid, server_models, cache)
-            entry = {"id": mid}
+            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
+            entry: Dict[str, Any] = {"id": mid}
             if ctx is not None:
-                entry["context_size"] = ctx
+                entry["limit"] = {"context": ctx, "output": 0}
+            else:
+                entry["limit"] = {"output": 0}
             new_models.append(entry)
         if new_models:
             conn["models"] = new_models
@@ -638,12 +717,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if isinstance(models_obj, list):
                     for e in models_obj:
                         mid = get_model_id_from_entry(e)
-                        ctx = e.get("context_size") if isinstance(e, dict) else None
-                        out.append({"id": mid, "context_size": ctx})
+                        ctx = None
+                        out_entry: Dict[str, Any] = {"id": mid}
+                        if isinstance(e, dict):
+                            # prefer new limit.context value if present
+                            lim = e.get("limit") or {}
+                            if isinstance(lim, dict) and isinstance(lim.get("context"), int):
+                                ctx = lim.get("context")
+                                out_entry["limit.context"] = ctx
+                                out_entry["limit.output"] = lim.get("output")
+                            else:
+                                ctx = e.get("context_size")
+                                if ctx is not None:
+                                    out_entry["context_size"] = ctx
+                        out.append(out_entry)
                 elif isinstance(models_obj, dict):
                     for mid, info in models_obj.items():
-                        ctx = info.get("context_size") if isinstance(info, dict) else None
-                        out.append({"id": mid, "context_size": ctx})
+                        out_entry = {"id": mid}
+                        if isinstance(info, dict):
+                            lim = info.get("limit") or {}
+                            if isinstance(lim, dict) and isinstance(lim.get("context"), int):
+                                out_entry["limit.context"] = lim.get("context")
+                                out_entry["limit.output"] = lim.get("output")
+                            else:
+                                ctx = info.get("context_size")
+                                if ctx is not None:
+                                    out_entry["context_size"] = ctx
+                        out.append(out_entry)
                 return out
 
             logging.info("  final models: %s", json.dumps(_models_map(final_models), ensure_ascii=False, indent=2))
