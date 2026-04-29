@@ -1,0 +1,11 @@
+# Ignore Python cache directories
+__pycache__/
+scripts/__pycache__/
+*.py[cod]
+
+# Ignore temporary working directories
+tmp/
+
+# Misc
+.DS_Store
+.pytest_cache/
