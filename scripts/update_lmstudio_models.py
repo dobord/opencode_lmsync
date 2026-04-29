@@ -216,26 +216,58 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
     def try_extract(v: Any) -> Optional[str]:
         if v is None:
             return None
+        # If this value is a plain string, treat it as a token (common simple case)
         if isinstance(v, str):
             return v
+
+        # Search dictionaries for known token-like keys and common nested sections.
         if isinstance(v, dict):
-            # Common keys
+            # direct token keys at this level
             for key in ("token", "api_key", "api_token", "access_token", "value", "key"):
                 if key in v and isinstance(v[key], str):
                     return v[key]
-            # headers.Authorization -> 'Bearer ...'
+
+            # headers.Authorization -> 'Bearer ...' or similar
             headers = v.get("headers") or v.get("auth")
             if isinstance(headers, dict):
                 authv = headers.get("Authorization") or headers.get("authorization")
                 if isinstance(authv, str):
-                    # strip Bearer
                     if authv.lower().startswith("bearer "):
                         return authv.split(None, 1)[1]
                     return authv
+
+            # Common nested sections that may contain keys, e.g. {"api": {"key": "..."}}
+            for nested in ("api", "credentials", "auth", "headers", "authorization"):
+                if nested in v:
+                    tok = try_extract(v[nested])
+                    if tok:
+                        return tok
+
+            # As a last resort, recurse into any dict/list children (but do not return simple strings
+            # found under arbitrary keys to avoid false positives).
+            for subv in v.values():
+                if isinstance(subv, (dict, list)):
+                    tok = try_extract(subv)
+                    if tok:
+                        return tok
+
+        # If this is a list, try items (items may be strings or dicts)
+        if isinstance(v, list):
+            for item in v:
+                tok = try_extract(item)
+                if tok:
+                    return tok
+
         return None
 
     # 1) Если auth — dict и содержит ключи, совпадающие с id/name/url подключения
     if isinstance(auth, dict):
+        # Если это подключение lmstudio и в auth.json есть секция 'lmstudio',
+        # отдадим ей приоритет (это типичный пользовательский кейс).
+        if conn.get("type") == "lmstudio" and "lmstudio" in auth:
+            tok = try_extract(auth["lmstudio"])
+            if tok:
+                return tok
         # Try direct identifiers
         for key in (conn.get("id"), conn.get("name"), base_url):
             if not key:
@@ -245,20 +277,63 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
                 if tok:
                     return tok
 
-        # Try to match by host substring in keys
-        if base_url:
-            for k, v in auth.items():
-                if not isinstance(k, str):
-                    continue
-                if k and k in base_url:
+        # Try to match by host/URL in top-level keys. Use normalized hostname
+        # comparison (preferred) and fall back to substring match for
+        # backward-compatibility with earlier auth.json shapes.
+        def _get_host(s: Optional[str]) -> Optional[str]:
+            """Return normalized hostname for a string that may be a bare host,
+            host:port, or a full URL. Returns lower-cased hostname or None.
+            """
+            if not s or not isinstance(s, str):
+                return None
+            s = s.strip()
+            if not s:
+                return None
+            # Ensure parseable URL
+            s_for_parse = s if ("://" in s) else ("http://" + s)
+            try:
+                p = urllib.parse.urlparse(s_for_parse)
+                if p.hostname:
+                    return p.hostname.lower()
+            except Exception:
+                pass
+            # fallback: split off port if present
+            if ":" in s:
+                return s.split(":", 1)[0].lower()
+            return s.lower()
+
+        base_host = _get_host(base_url) if base_url else None
+        for k, v in auth.items():
+            if not isinstance(k, str):
+                continue
+            # Prefer normalized hostname equality
+            if base_host:
+                key_host = _get_host(k)
+                if key_host and key_host == base_host:
                     tok = try_extract(v)
                     if tok:
                         return tok
+            # Fallback to substring match for legacy keys
+            if k and base_url and k in base_url:
+                tok = try_extract(v)
+                if tok:
+                    return tok
 
         # If auth contains a single top-level token-like key, use it as global
         for k in ("lm_api_token", "LM_API_TOKEN", "token", "api_token", "api_key"):
-            if k in auth and isinstance(auth[k], str):
-                return auth[k]
+            if k in auth:
+                tok = try_extract(auth[k])
+                if tok:
+                    return tok
+
+        # As a last resort for dict-shaped auth, try to find any token anywhere
+        # inside the auth structure. This covers cases where tokens are nested
+        # under arbitrary keys (e.g. {"hosts": [{...}]}) and earlier heuristics
+        # did not match. Use this only as low-priority fallback to avoid false
+        # positives.
+        tok = try_extract(auth)
+        if tok:
+            return tok
 
     # 2) If auth is a list, try to find an entry matching base_url/host
     if isinstance(auth, list):
@@ -638,6 +713,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     total_changed = False
+    cache_modified = False
     for conn in connections:
         try:
             if conn.get("type") != "lmstudio":
@@ -675,8 +751,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          json.dumps(current_models, ensure_ascii=False, indent=2) if current_models is not None else "None")
 
             # Показываем кэшированные значения до запроса
-            cache_before = cache.get(connection_key, {})
-            logging.info("  cache (before): %s", json.dumps(cache_before, ensure_ascii=False, indent=2) if cache_before else "{}")
+            # Make a shallow copy so we can detect later whether cache for this
+            # connection was modified (we persist cache file if it was).
+            conn_cache_before = dict(cache.get(connection_key, {}))
+            logging.info("  cache (before): %s", json.dumps(conn_cache_before, ensure_ascii=False, indent=2) if conn_cache_before else "{}")
 
             # Выполняем запрос к серверу
             resp = request_models(base_url, token)
@@ -709,6 +787,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Показываем кэш после обновления
             cache_after = cache.get(connection_key, {})
             logging.info("  cache (after): %s", json.dumps(cache_after, ensure_ascii=False, indent=2) if cache_after else "{}")
+            # If the cache for this connection changed, remember it so we can
+            # persist the cache file even when no config changes were made.
+            if conn_cache_before != cache_after:
+                cache_modified = True
 
             # Показываем итоговый набор моделей (id -> context_size)
             final_models = conn.get("models")
@@ -717,15 +799,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if isinstance(models_obj, list):
                     for e in models_obj:
                         mid = get_model_id_from_entry(e)
-                        ctx = None
                         out_entry: Dict[str, Any] = {"id": mid}
                         if isinstance(e, dict):
-                            # prefer new limit.context value if present
-                            lim = e.get("limit") or {}
+                            # prefer new nested limit section if present
+                            lim = e.get("limit")
                             if isinstance(lim, dict) and isinstance(lim.get("context"), int):
-                                ctx = lim.get("context")
-                                out_entry["limit.context"] = ctx
-                                out_entry["limit.output"] = lim.get("output")
+                                out_entry["limit"] = {
+                                    "context": lim.get("context"),
+                                    "output": lim.get("output"),
+                                }
                             else:
                                 ctx = e.get("context_size")
                                 if ctx is not None:
@@ -735,10 +817,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for mid, info in models_obj.items():
                         out_entry = {"id": mid}
                         if isinstance(info, dict):
-                            lim = info.get("limit") or {}
+                            lim = info.get("limit")
                             if isinstance(lim, dict) and isinstance(lim.get("context"), int):
-                                out_entry["limit.context"] = lim.get("context")
-                                out_entry["limit.output"] = lim.get("output")
+                                out_entry["limit"] = {
+                                    "context": lim.get("context"),
+                                    "output": lim.get("output"),
+                                }
                             else:
                                 ctx = info.get("context_size")
                                 if ctx is not None:
@@ -751,11 +835,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             logging.exception("Ошибка при обработке подключения: %s", e)
 
-    if total_changed and not args.dry_run:
+    if (total_changed or cache_modified) and not args.dry_run:
         try:
-            safe_write_json(config_path, cfg)
-            safe_write_json(cache_path, cache)
-            logging.info("Конфиг и кэш успешно сохранены")
+            # Persist only the files that changed to avoid unnecessary rewrites.
+            if total_changed:
+                safe_write_json(config_path, cfg)
+            if cache_modified:
+                safe_write_json(cache_path, cache)
+            if total_changed and cache_modified:
+                logging.info("Конфиг и кэш успешно сохранены")
+            elif total_changed:
+                logging.info("Конфиг успешно сохранён")
+            else:
+                logging.info("Кэш успешно сохранён")
         except Exception as e:
             logging.error("Не удалось сохранить файлы: %s", e)
             return 3
