@@ -27,8 +27,13 @@ update_lmstudio_models.py
   --config-path    Путь к opencode.json (по умолчанию ~/.config/opencode/opencode.json)
   --auth-path      Путь к auth.json (по умолчанию ~/.local/share/opencode/auth.json)
   --cache-path     Путь к файлу кэша (по умолчанию ~/.local/share/opencode/lmstudio_context_cache.json)
-  --dry-run        Не записывать изменения, только показать что будет изменено
-  --verbose        Подробный вывод
+   --dry-run        Не записывать изменения, только показать что будет изменено
+   --verbose        Подробный вывод
+  Новые опции:
+   --add-connection HOST[:PORT|/path]  Добавить подключение lmstudio по указанному адресу (например example.com:8080 или http://example.com:8080)
+   --api-key KEY                       API ключ для нового подключения (если указан, будет записан в подключение)
+   --connection-name NAME              Человекочитаемое имя для создаваемого подключения
+   --no-autoload                        Если указан при добавлении подключения, не загружать модели автоматически
 
 """
 from __future__ import annotations
@@ -262,12 +267,6 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
 
     # 1) Если auth — dict и содержит ключи, совпадающие с id/name/url подключения
     if isinstance(auth, dict):
-        # Если это подключение lmstudio и в auth.json есть секция 'lmstudio',
-        # отдадим ей приоритет (это типичный пользовательский кейс).
-        if conn.get("type") == "lmstudio" and "lmstudio" in auth:
-            tok = try_extract(auth["lmstudio"])
-            if tok:
-                return tok
         # Try direct identifiers
         for key in (conn.get("id"), conn.get("name"), base_url):
             if not key:
@@ -319,6 +318,13 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
                 if tok:
                     return tok
 
+        # Если это подключение lmstudio и в auth.json есть секция 'lmstudio',
+        # используем её как fallback для подключений без host-specific ключа.
+        if conn.get("type") == "lmstudio" and "lmstudio" in auth:
+            tok = try_extract(auth["lmstudio"])
+            if tok:
+                return tok
+
         # If auth contains a single top-level token-like key, use it as global
         for k in ("lm_api_token", "LM_API_TOKEN", "token", "api_token", "api_key"):
             if k in auth:
@@ -352,6 +358,49 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
                 return tok
 
     return None
+
+
+def extract_token_from_conn(conn: Any) -> Optional[str]:
+    """Try to extract an API token from a connection dict itself.
+    This mirrors the heuristics used for auth.json but looks inside the
+    connection description so CLI-added connections with --api-key work.
+    """
+    if conn is None:
+        return None
+
+    def try_extract(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            for key in ("token", "api_key", "api_token", "access_token", "value", "key"):
+                if key in v and isinstance(v[key], str):
+                    return v[key]
+
+            headers = v.get("headers") or v.get("auth")
+            if isinstance(headers, dict):
+                authv = headers.get("Authorization") or headers.get("authorization")
+                if isinstance(authv, str):
+                    if authv.lower().startswith("bearer "):
+                        return authv.split(None, 1)[1]
+                    return authv
+
+            for nested in ("api", "credentials", "auth", "headers", "authorization"):
+                if nested in v:
+                    tok = try_extract(v[nested])
+                    if tok:
+                        return tok
+
+        if isinstance(v, list):
+            for item in v:
+                tok = try_extract(item)
+                if tok:
+                    return tok
+
+        return None
+
+    return try_extract(conn)
 
 
 def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -669,6 +718,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cache-path", default=DEFAULT_CACHE_PATH)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--add-connection", help="Добавить lmstudio подключение (host[:port] или URL)")
+    parser.add_argument("--api-key", help="API ключ для добавляемого подключения")
+    parser.add_argument("--connection-name", help="Имя для добавляемого подключения")
+    parser.add_argument("--no-autoload", action="store_true", help="При добавлении подключения не загружать модели автоматически")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -686,11 +739,119 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     auth = load_json(auth_path)
+    # Track whether we modified auth in-memory so we can persist it later.
+    auth_modified = False
 
     cache = load_json(cache_path) or {}
     # ensure cache shape: {connection_key: {instance_id: ctx, ...}}
     if not isinstance(cache, dict):
         cache = {}
+
+    # If requested, add a new connection to the in-memory config before we
+    # discover connections. The new connection will be processed in the same
+    # run and (unless --dry-run) persisted to the config file.
+    if args.add_connection:
+        host = args.add_connection.strip()
+        new_conn: Dict[str, Any] = {"type": "lmstudio"}
+        # store base_url so get_base_url_from_conn can parse it
+        new_conn["base_url"] = host
+        # Determine a human-friendly hostname for display (without port)
+        try:
+            p = urllib.parse.urlparse(host if "://" in host else ("http://" + host))
+            hostname = p.hostname or p.netloc or host
+        except Exception:
+            hostname = host
+
+        # Build a base display name like "LM Studio (192.168.1.82)" and ensure
+        # uniqueness among existing connections by appending a numeric suffix if needed.
+        existing_conns = find_connection_nodes(cfg)
+        used_names = set()
+        for c in existing_conns:
+            if isinstance(c, dict):
+                cid = c.get("id")
+                cname = c.get("name")
+                if isinstance(cid, str):
+                    used_names.add(cid)
+                if isinstance(cname, str):
+                    used_names.add(cname)
+
+        base_display = f"LM Studio ({hostname})"
+        candidate = base_display
+        idx = 2
+        while candidate in used_names:
+            candidate = f"{base_display} #{idx}"
+            idx += 1
+
+        # Use the unique candidate for both id and name unless user provided a name
+        new_conn["id"] = candidate
+        new_conn["name"] = args.connection_name or candidate
+        # mark new connection so we can treat it specially in the processing loop
+        new_conn["_added_by_cli"] = True
+        # If API key provided, write it into auth.json (preferred) rather than
+        # storing it directly in the config entry. Use a structured object so
+        # auth.json remains consistent with other entries (type/key).
+        # Compute a network identifier for auth (netloc includes optional port).
+        try:
+            parsed = urllib.parse.urlparse(host if "://" in host else ("http://" + host))
+            netloc_str = parsed.netloc or parsed.hostname or host
+        except Exception:
+            netloc_str = host
+
+        if args.api_key:
+            # ensure auth is a dict we can write into
+            if not isinstance(auth, dict):
+                auth = {}
+            # Use the netloc (host[:port]) as the key in auth.json so hostname
+            # matching heuristics in extract_token_from_auth will work.
+            auth_key = netloc_str
+            existing = auth.get(auth_key)
+            if not (isinstance(existing, dict) and existing.get("key") == args.api_key):
+                auth[auth_key] = {"type": "api", "key": args.api_key}
+                auth_modified = True
+                logging.info("Added API key to auth.json under key '%s'", auth_key)
+
+        # inject into provider mapping (preferred shape for opencode config)
+        if isinstance(cfg, dict):
+            providers = cfg.setdefault("provider", {})
+            # Build a machine-friendly provider key (no spaces) based on netloc
+            safe_host = "".join(c if c.isalnum() else "_" for c in netloc_str).lower()
+            base_key = f"lmstudio_{safe_host}" if safe_host else "lmstudio"
+            prov_key = base_key
+            idx = 2
+            while prov_key in providers:
+                prov_key = f"{base_key}_{idx}"
+                idx += 1
+
+            # build provider object similar to existing providers (if a template exists)
+            base_url_for_options = host if "://" in host else ("http://" + host)
+            # If no path provided, append /v1 which is the typical LM Studio API path
+            try:
+                p_opt = urllib.parse.urlparse(base_url_for_options)
+                if not p_opt.path or p_opt.path == "/":
+                    base_url_for_options = base_url_for_options.rstrip("/") + "/v1"
+            except Exception:
+                # leave as-is on parse errors
+                pass
+            template = providers.get("lmstudio") if isinstance(providers.get("lmstudio"), dict) else None
+            provider_obj: Dict[str, Any] = {}
+            if template and isinstance(template.get("npm"), str):
+                provider_obj["npm"] = template.get("npm")
+            provider_obj.update({
+                "type": "lmstudio",
+                "name": new_conn.get("name"),
+                "id": new_conn.get("id"),
+                "options": {"baseURL": base_url_for_options},
+            })
+            # mark so the processing loop can detect CLI-added providers
+            provider_obj["_added_by_cli"] = True
+            # initialize empty models mapping if template uses models
+            if template and ("models" in template):
+                provider_obj["models"] = {}
+
+            providers[prov_key] = provider_obj
+            logging.info("Added provider entry provider['%s'] name=%s base_url=%s", prov_key, provider_obj.get("name"), base_url_for_options)
+        else:
+            logging.error("Config file has unexpected shape; cannot add connection")
 
     # Find connection nodes in several common shapes.
     connections = find_connection_nodes(cfg)
@@ -726,10 +887,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             connection_key = base_url  # используем base_url как ключ кеша
 
-            # Найдём токен: сначала auth.json, затем LM_API_TOKEN (определяем источник)
+            # Найдём токен: сначала в самом описании подключения (если пользователь
+            # добавил его через --api-key), затем в auth.json, затем LM_API_TOKEN
+            token_from_conn = extract_token_from_conn(conn)
             token_from_auth = extract_token_from_auth(auth, conn, base_url)
             token_env = os.environ.get("LM_API_TOKEN")
-            if token_from_auth:
+            if token_from_conn:
+                token = token_from_conn
+                token_source = "conn"
+            elif token_from_auth:
                 token = token_from_auth
                 token_source = "auth.json"
             elif token_env:
@@ -744,6 +910,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             conn_name = conn.get("name")
             logging.info("Обрабатываю lmstudio подключение id=%s name=%s base_url=%s token_source=%s",
                          conn_id or "<none>", conn_name or "<none>", base_url, token_source)
+
+            # If this connection was added by CLI and the user requested no autoload,
+            # skip attempting to fetch models from server but ensure config will be
+            # persisted.
+            if conn.get("_added_by_cli") and args.no_autoload:
+                logging.info("New connection added via CLI and --no-autoload: skipping model fetch for %s", conn.get("id"))
+                total_changed = True
+                # show current models (which will likely be None) and continue
+                continue
 
             # Показываем текущие модели в конфиге (до изменений)
             current_models = conn.get("models")
@@ -835,17 +1010,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             logging.exception("Ошибка при обработке подключения: %s", e)
 
-    if (total_changed or cache_modified) and not args.dry_run:
+    if (total_changed or cache_modified or auth_modified) and not args.dry_run:
         try:
             # Persist only the files that changed to avoid unnecessary rewrites.
             if total_changed:
                 safe_write_json(config_path, cfg)
             if cache_modified:
                 safe_write_json(cache_path, cache)
+            if auth_modified:
+                safe_write_json(auth_path, auth)
             if total_changed and cache_modified:
                 logging.info("Конфиг и кэш успешно сохранены")
             elif total_changed:
                 logging.info("Конфиг успешно сохранён")
+            elif auth_modified:
+                logging.info("auth.json успешно сохранён")
             else:
                 logging.info("Кэш успешно сохранён")
         except Exception as e:
