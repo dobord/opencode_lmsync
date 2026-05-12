@@ -57,6 +57,7 @@ DEFAULT_CACHE_PATH = os.path.expanduser(
     "~/.local/share/opencode/lmstudio_context_cache.json"
 )
 DEFAULT_LMSTUDIO_PORT = 1234
+INTERNAL_FIELDS = ("_added_by_cli", "_provider_key")
 
 
 def build_lmstudio_config_base_url(raw: str, default_port: int = DEFAULT_LMSTUDIO_PORT) -> str:
@@ -106,7 +107,7 @@ def safe_write_json(path: str, data: Any) -> None:
     tmp.replace(p)
 
 
-def strip_internal_fields(obj: Any, fields: Iterable[str] = ("_added_by_cli",)) -> None:
+def strip_internal_fields(obj: Any, fields: Iterable[str] = INTERNAL_FIELDS) -> None:
     if isinstance(obj, dict):
         for field in fields:
             obj.pop(field, None)
@@ -115,6 +116,27 @@ def strip_internal_fields(obj: Any, fields: Iterable[str] = ("_added_by_cli",)) 
     elif isinstance(obj, list):
         for item in obj:
             strip_internal_fields(item, fields)
+
+
+def annotate_provider_keys(cfg: Any) -> None:
+    if not isinstance(cfg, dict):
+        return
+    providers = cfg.get("provider")
+    if not isinstance(providers, dict):
+        return
+    for provider_key, provider in providers.items():
+        if isinstance(provider_key, str) and isinstance(provider, dict):
+            provider["_provider_key"] = provider_key
+
+
+def set_auth_api_key(auth: Any, auth_key: str, api_key: str) -> Tuple[Dict[str, Any], bool]:
+    if not isinstance(auth, dict):
+        auth = {}
+    existing = auth.get(auth_key)
+    if isinstance(existing, dict) and existing.get("type") == "api" and existing.get("key") == api_key:
+        return auth, False
+    auth[auth_key] = {"type": "api", "key": api_key}
+    return auth, True
 
 
 def find_connection_nodes(obj: Any) -> List[Dict[str, Any]]:
@@ -305,7 +327,7 @@ def extract_token_from_auth(auth: Any, conn: Dict[str, Any], base_url: Optional[
     # 1) Если auth — dict и содержит ключи, совпадающие с id/name/url подключения
     if isinstance(auth, dict):
         # Try direct identifiers
-        for key in (conn.get("id"), conn.get("name"), base_url):
+        for key in (conn.get("_provider_key"), conn.get("id"), conn.get("name"), base_url):
             if not key:
                 continue
             if key in auth:
@@ -800,31 +822,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             netloc_str = host
 
-        if args.api_key:
-            # ensure auth is a dict we can write into
-            if not isinstance(auth, dict):
-                auth = {}
-            # Use the netloc (host[:port]) as the key in auth.json so hostname
-            # matching heuristics in extract_token_from_auth will work.
-            auth_key = netloc_str
-            existing = auth.get(auth_key)
-            if not (isinstance(existing, dict) and existing.get("key") == args.api_key):
-                auth[auth_key] = {"type": "api", "key": args.api_key}
-                auth_modified = True
-                logging.info("Added API key to auth.json under key '%s'", auth_key)
-        elif os.environ.get("LM_API_TOKEN"):
-            # If the user is adding a protected server and only supplied the
-            # token via LM_API_TOKEN, persist it so later opencode runs can
-            # authenticate even when --no-autoload skips the fetch.
-            if not isinstance(auth, dict):
-                auth = {}
-            auth_key = netloc_str
-            env_token = os.environ.get("LM_API_TOKEN")
-            existing = auth.get(auth_key)
-            if env_token and not (isinstance(existing, dict) and existing.get("key") == env_token):
-                auth[auth_key] = {"type": "api", "key": env_token}
-                auth_modified = True
-                logging.info("Added API key from LM_API_TOKEN to auth.json under key '%s'", auth_key)
+        pending_api_key = args.api_key or os.environ.get("LM_API_TOKEN")
+        pending_api_key_source = "--api-key" if args.api_key else "LM_API_TOKEN" if pending_api_key else None
 
         # inject into provider mapping (preferred shape for opencode config)
         if isinstance(cfg, dict):
@@ -837,6 +836,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             while prov_key in providers:
                 prov_key = f"{base_key}_{idx}"
                 idx += 1
+
+            if pending_api_key:
+                auth, stored_auth = set_auth_api_key(auth, prov_key, pending_api_key)
+                if stored_auth:
+                    auth_modified = True
+                    logging.info(
+                        "Added API key from %s to auth.json under provider id '%s'",
+                        pending_api_key_source,
+                        prov_key,
+                    )
 
             # build provider object similar to existing providers (if a template exists)
             base_url_for_options = new_conn["base_url"]
@@ -852,6 +861,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             })
             # mark so the processing loop can detect CLI-added providers
             provider_obj["_added_by_cli"] = True
+            provider_obj["_provider_key"] = prov_key
             # keep the models shape stable even before autoload fills it
             provider_obj["models"] = {}
 
@@ -862,6 +872,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("Config file has unexpected shape; cannot add connection")
 
     # Find connection nodes in several common shapes.
+    annotate_provider_keys(cfg)
     connections = find_connection_nodes(cfg)
 
     # Some configs (like opencode) may list providers under cfg['provider']['lmstudio']
@@ -912,6 +923,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 token = None
                 token_source = "none"
+
+            provider_key = conn.get("_provider_key")
+            if isinstance(provider_key, str) and token and token_source == "auth.json" and isinstance(auth, dict):
+                auth, stored_auth = set_auth_api_key(auth, provider_key, token)
+                if stored_auth:
+                    auth_modified = True
+                    logging.info("Migrated API key in auth.json to provider id '%s'", provider_key)
 
             # Информация о подключении и текущем состоянии
             conn_id = conn.get("id")
