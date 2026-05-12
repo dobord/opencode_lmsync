@@ -617,6 +617,21 @@ def update_connection_models(
     # current models in connection
     models_obj = conn.get("models")
 
+    if isinstance(models_obj, list):
+        converted_models: Dict[str, Any] = {}
+        for entry in models_obj:
+            mid = get_model_id_from_entry(entry)
+            if not mid:
+                continue
+            if isinstance(entry, dict):
+                converted_models[str(mid)] = entry
+            else:
+                converted_models[str(mid)] = {"limit": {"output": 0}}
+        models_obj = converted_models
+        conn["models"] = models_obj
+        changed = True
+        messages.append(f"models: converted list to object with {len(converted_models)} entries")
+
     # Ensure we don't leave or write legacy context keys into the config.
     banned_keys = {
         "context_window",
@@ -626,16 +641,7 @@ def update_connection_models(
         "contextLength",
         "context_length",
     }
-    if isinstance(models_obj, list):
-        for entry in models_obj:
-            if isinstance(entry, dict):
-                mid = get_model_id_from_entry(entry) or "<unknown>"
-                for bk in list(banned_keys):
-                    if bk in entry:
-                        entry.pop(bk, None)
-                        changed = True
-                        messages.append(f"models: removed {mid}.{bk}")
-    elif isinstance(models_obj, dict):
+    if isinstance(models_obj, dict):
         for mid, info in list(models_obj.items()):
             if isinstance(info, dict):
                 for bk in list(banned_keys):
@@ -644,94 +650,49 @@ def update_connection_models(
                         changed = True
                         messages.append(f"models[{mid}]: removed {bk}")
 
-    # Build existing map: model_id -> (entry, index) for lists
-    if isinstance(models_obj, list):
-        existing_map: Dict[str, Tuple[Any, int]] = {}
-        for idx, entry in enumerate(models_obj):
-            mid = get_model_id_from_entry(entry)
-            if mid:
-                existing_map[str(mid)] = (entry, idx)
-
-        # Update existing entries
-        for mid, (entry, idx) in list(existing_map.items()):
-            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
-            if ctx is not None:
-                # if entry is string, replace with dict; ensure limit/context/output are set
-                if isinstance(entry, str):
-                    # replace string entry with dict containing only limit
-                    new_entry: Dict[str, Any] = {"id": mid, "limit": {"context": ctx, "output": 0}}
-                    conn["models"][idx] = new_entry
-                    changed = True
-                    messages.append(f"models: set {mid}.limit.context={ctx}")
-                    messages.append(f"models: set {mid}.limit.output=0")
-                elif isinstance(entry, dict):
-                    # update legacy context_size if needed
-                    # ensure limit dict exists and has context/output
-                    lim = entry.setdefault("limit", {})
-                    if lim.get("context") != ctx:
-                        lim["context"] = ctx
-                        changed = True
-                        messages.append(f"models: set {mid}.limit.context={ctx}")
-                    if "output" not in lim:
-                        lim["output"] = 0
-                        changed = True
-                        messages.append(f"models: set {mid}.limit.output=0")
-
-        # Add missing server models that are not present in config
-        for mid, maxctx in server_models.items():
-            if mid in existing_map:
+        for mid, info in list(models_obj.items()):
+            if not isinstance(info, dict):
+                models_obj[mid] = {"limit": {"output": 0}}
+                changed = True
+                messages.append(f"models[{mid}].limit.output=0")
                 continue
-            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
-            entry: Dict[str, Any] = {"id": mid}
-            # set limit (do not write legacy context_size)
-            if ctx is not None:
-                entry["limit"] = {"context": ctx, "output": 0}
-            else:
-                # still initialize limit.output
-                entry["limit"] = {"output": 0}
-            conn.setdefault("models", []).append(entry)
-            changed = True
-            messages.append(f"models: add {mid} limit.context={ctx}")
-            messages.append(f"models: add {mid} limit.output=0")
+            lim = info.setdefault("limit", {})
+            if "output" not in lim:
+                lim["output"] = 0
+                changed = True
+                messages.append(f"models[{mid}].limit.output=0")
 
-    elif isinstance(models_obj, dict):
-        # keys are model ids
-        for mid, info in models_obj.items():
+        # Update existing entries and add missing server models.
+        for mid, maxctx in server_models.items():
             ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
-            if ctx is not None:
-                if not isinstance(info, dict):
-                    # replace non-dict entry with dict containing only limit
-                    models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
-                    changed = True
-                    messages.append(f"models[{mid}].limit.context={ctx}")
-                    messages.append(f"models[{mid}].limit.output=0")
-                else:
-                    lim = info.setdefault("limit", {})
-                    if lim.get("context") != ctx:
-                        lim["context"] = ctx
+            if mid in models_obj:
+                info = models_obj[mid]
+                if ctx is not None:
+                    if not isinstance(info, dict):
+                        models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
                         changed = True
                         messages.append(f"models[{mid}].limit.context={ctx}")
-                    if "output" not in lim:
-                        lim["output"] = 0
-                        changed = True
                         messages.append(f"models[{mid}].limit.output=0")
-
-        # add missing server models
-        for mid, maxctx in server_models.items():
-            if mid in models_obj:
-                continue
-            ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
-            if ctx is not None:
-                models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
+                    else:
+                        lim = info.setdefault("limit", {})
+                        if lim.get("context") != ctx:
+                            lim["context"] = ctx
+                            changed = True
+                            messages.append(f"models[{mid}].limit.context={ctx}")
             else:
-                models_obj[mid] = {"limit": {"output": 0}}
-            changed = True
-            messages.append(f"models: add {mid} limit.context={ctx}")
-            messages.append(f"models: add {mid} limit.output=0")
+                entry: Dict[str, Any] = {"id": mid}
+                if ctx is not None:
+                    entry["limit"] = {"context": ctx, "output": 0}
+                else:
+                    entry["limit"] = {"output": 0}
+                models_obj[mid] = entry
+                changed = True
+                messages.append(f"models: add {mid} limit.context={ctx}")
+                messages.append(f"models: add {mid} limit.output=0")
 
     else:
-        # no models defined, create list from server_models
-        new_models = []
+        # no models defined, create object from server_models
+        new_models: Dict[str, Any] = {}
         for mid, maxctx in server_models.items():
             ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
             entry: Dict[str, Any] = {"id": mid}
@@ -739,7 +700,7 @@ def update_connection_models(
                 entry["limit"] = {"context": ctx, "output": 0}
             else:
                 entry["limit"] = {"output": 0}
-            new_models.append(entry)
+            new_models[mid] = entry
         if new_models:
             conn["models"] = new_models
             changed = True
@@ -851,6 +812,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 auth[auth_key] = {"type": "api", "key": args.api_key}
                 auth_modified = True
                 logging.info("Added API key to auth.json under key '%s'", auth_key)
+        elif os.environ.get("LM_API_TOKEN"):
+            # If the user is adding a protected server and only supplied the
+            # token via LM_API_TOKEN, persist it so later opencode runs can
+            # authenticate even when --no-autoload skips the fetch.
+            if not isinstance(auth, dict):
+                auth = {}
+            auth_key = netloc_str
+            env_token = os.environ.get("LM_API_TOKEN")
+            existing = auth.get(auth_key)
+            if env_token and not (isinstance(existing, dict) and existing.get("key") == env_token):
+                auth[auth_key] = {"type": "api", "key": env_token}
+                auth_modified = True
+                logging.info("Added API key from LM_API_TOKEN to auth.json under key '%s'", auth_key)
 
         # inject into provider mapping (preferred shape for opencode config)
         if isinstance(cfg, dict):
@@ -878,9 +852,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             })
             # mark so the processing loop can detect CLI-added providers
             provider_obj["_added_by_cli"] = True
-            # initialize empty models mapping if template uses models
-            if template and ("models" in template):
-                provider_obj["models"] = {}
+            # keep the models shape stable even before autoload fills it
+            provider_obj["models"] = {}
 
             providers[prov_key] = provider_obj
             config_modified = True
