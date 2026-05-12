@@ -56,6 +56,32 @@ DEFAULT_AUTH_PATH = os.path.expanduser("~/.local/share/opencode/auth.json")
 DEFAULT_CACHE_PATH = os.path.expanduser(
     "~/.local/share/opencode/lmstudio_context_cache.json"
 )
+DEFAULT_LMSTUDIO_PORT = 1234
+
+
+def build_lmstudio_config_base_url(raw: str, default_port: int = DEFAULT_LMSTUDIO_PORT) -> str:
+    raw = raw.strip()
+    candidate = raw if "://" in raw else f"http://{raw}"
+    parsed = urllib.parse.urlparse(candidate)
+    host = parsed.hostname or parsed.netloc or parsed.path
+    if not host:
+        return raw.rstrip("/")
+    port = parsed.port or default_port
+    path = parsed.path if parsed.path and parsed.path != "/" else "/v1"
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{parsed.scheme or 'http'}://{host}:{port}{path.rstrip('/')}"
+
+
+def normalize_lmstudio_request_base_url(raw: str, default_port: int = DEFAULT_LMSTUDIO_PORT) -> str:
+    raw = raw.strip()
+    candidate = raw if "://" in raw else f"http://{raw}"
+    parsed = urllib.parse.urlparse(candidate)
+    host = parsed.hostname or parsed.netloc or parsed.path
+    if not host:
+        return raw.rstrip("/")
+    port = parsed.port or default_port
+    return f"{parsed.scheme or 'http'}://{host}:{port}"
 
 
 def load_json(path: str) -> Optional[Any]:
@@ -78,6 +104,17 @@ def safe_write_json(path: str, data: Any) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     tmp.replace(p)
+
+
+def strip_internal_fields(obj: Any, fields: Iterable[str] = ("_added_by_cli",)) -> None:
+    if isinstance(obj, dict):
+        for field in fields:
+            obj.pop(field, None)
+        for value in obj.values():
+            strip_internal_fields(value, fields)
+    elif isinstance(obj, list):
+        for item in obj:
+            strip_internal_fields(item, fields)
 
 
 def find_connection_nodes(obj: Any) -> List[Dict[str, Any]]:
@@ -134,12 +171,12 @@ def get_base_url_from_conn(conn: Dict[str, Any]) -> Optional[str]:
                 p = urllib.parse.urlparse(s_for_parse)
                 if p.netloc:
                     # return only scheme://netloc (strip any path)
-                    return f"{p.scheme}://{p.netloc}"
+                    return normalize_lmstudio_request_base_url(f"{p.scheme}://{p.netloc}")
             except Exception:
                 # fallback to simple behavior
                 if "://" not in s:
                     s = "http://" + s
-                return s.rstrip("/")
+                return normalize_lmstudio_request_base_url(s.rstrip("/"))
 
     # Попробуем собрать из host + port
     host = conn.get("host") or conn.get("hostname")
@@ -150,7 +187,7 @@ def get_base_url_from_conn(conn: Dict[str, Any]) -> Optional[str]:
             try:
                 p = urllib.parse.urlparse(host if "://" in host else f"http://{host}")
                 if p.netloc:
-                    return f"{p.scheme}://{p.netloc}"
+                    return normalize_lmstudio_request_base_url(f"{p.scheme}://{p.netloc}")
             except Exception:
                 pass
         # Otherwise build from host(+port)
@@ -159,8 +196,8 @@ def get_base_url_from_conn(conn: Dict[str, Any]) -> Optional[str]:
         else:
             host_str = str(host)
         if port:
-            return f"http://{host_str.rstrip('/')}:{port}"
-        return f"http://{host_str.rstrip('/')}"
+            return normalize_lmstudio_request_base_url(f"http://{host_str.rstrip('/')}:{port}")
+        return normalize_lmstudio_request_base_url(f"http://{host_str.rstrip('/')}")
 
     # Некоторые провайдеры хранят url в nested options, например {"options": {"baseURL": "http://.../v1"}}
     options = conn.get("options") or conn.get("config") or conn.get("settings")
@@ -178,11 +215,11 @@ def get_base_url_from_conn(conn: Dict[str, Any]) -> Optional[str]:
                 try:
                     p = urllib.parse.urlparse(s_for_parse)
                     if p.netloc:
-                        return f"{p.scheme}://{p.netloc}"
+                        return normalize_lmstudio_request_base_url(f"{p.scheme}://{p.netloc}")
                 except Exception:
                     if "://" not in s:
                         s = "http://" + s
-                    return s.rstrip("/")
+                    return normalize_lmstudio_request_base_url(s.rstrip("/"))
 
     return None
 
@@ -733,14 +770,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth_path = os.path.expanduser(args.auth_path)
     cache_path = os.path.expanduser(args.cache_path)
 
+    config_exists = Path(config_path).exists()
     cfg = load_json(config_path)
     if cfg is None:
-        logging.error("Не удалось загрузить конфиг %s", config_path)
-        return 2
+        if config_exists:
+            logging.error("Не удалось загрузить конфиг %s", config_path)
+            return 2
+        logging.info("Конфиг %s не найден, начинаю с пустой конфигурации", config_path)
+        cfg = {}
 
     auth = load_json(auth_path)
     # Track whether we modified auth in-memory so we can persist it later.
     auth_modified = False
+    config_modified = False
 
     cache = load_json(cache_path) or {}
     # ensure cache shape: {connection_key: {instance_id: ctx, ...}}
@@ -753,11 +795,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.add_connection:
         host = args.add_connection.strip()
         new_conn: Dict[str, Any] = {"type": "lmstudio"}
-        # store base_url so get_base_url_from_conn can parse it
-        new_conn["base_url"] = host
+        # store normalized base_url so get_base_url_from_conn can parse it
+        new_conn["base_url"] = build_lmstudio_config_base_url(host)
         # Determine a human-friendly hostname for display (without port)
         try:
-            p = urllib.parse.urlparse(host if "://" in host else ("http://" + host))
+            p = urllib.parse.urlparse(new_conn["base_url"])
             hostname = p.hostname or p.netloc or host
         except Exception:
             hostname = host
@@ -792,7 +834,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # auth.json remains consistent with other entries (type/key).
         # Compute a network identifier for auth (netloc includes optional port).
         try:
-            parsed = urllib.parse.urlparse(host if "://" in host else ("http://" + host))
+            parsed = urllib.parse.urlparse(new_conn["base_url"])
             netloc_str = parsed.netloc or parsed.hostname or host
         except Exception:
             netloc_str = host
@@ -823,15 +865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 idx += 1
 
             # build provider object similar to existing providers (if a template exists)
-            base_url_for_options = host if "://" in host else ("http://" + host)
-            # If no path provided, append /v1 which is the typical LM Studio API path
-            try:
-                p_opt = urllib.parse.urlparse(base_url_for_options)
-                if not p_opt.path or p_opt.path == "/":
-                    base_url_for_options = base_url_for_options.rstrip("/") + "/v1"
-            except Exception:
-                # leave as-is on parse errors
-                pass
+            base_url_for_options = new_conn["base_url"]
             template = providers.get("lmstudio") if isinstance(providers.get("lmstudio"), dict) else None
             provider_obj: Dict[str, Any] = {}
             if template and isinstance(template.get("npm"), str):
@@ -849,6 +883,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 provider_obj["models"] = {}
 
             providers[prov_key] = provider_obj
+            config_modified = True
             logging.info("Added provider entry provider['%s'] name=%s base_url=%s", prov_key, provider_obj.get("name"), base_url_for_options)
         else:
             logging.error("Config file has unexpected shape; cannot add connection")
@@ -1010,23 +1045,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             logging.exception("Ошибка при обработке подключения: %s", e)
 
-    if (total_changed or cache_modified or auth_modified) and not args.dry_run:
+    if (total_changed or cache_modified or auth_modified or config_modified) and not args.dry_run:
         try:
             # Persist only the files that changed to avoid unnecessary rewrites.
-            if total_changed:
+            if total_changed or config_modified:
+                strip_internal_fields(cfg)
                 safe_write_json(config_path, cfg)
             if cache_modified:
                 safe_write_json(cache_path, cache)
             if auth_modified:
                 safe_write_json(auth_path, auth)
-            if total_changed and cache_modified:
-                logging.info("Конфиг и кэш успешно сохранены")
-            elif total_changed:
+            if total_changed or config_modified:
                 logging.info("Конфиг успешно сохранён")
-            elif auth_modified:
-                logging.info("auth.json успешно сохранён")
-            else:
+            if cache_modified:
                 logging.info("Кэш успешно сохранён")
+            if auth_modified:
+                logging.info("auth.json успешно сохранён")
         except Exception as e:
             logging.error("Не удалось сохранить файлы: %s", e)
             return 3
