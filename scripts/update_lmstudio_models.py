@@ -16,9 +16,11 @@ update_lmstudio_models.py
     по ключу loaded_instances[i].id (в кеше они привязаны к подключению)
   * models -> у каждой модели берётся max_context_length как запасной вариант
  - Обновляет в конфиге opencode.json список моделей у каждого подключения
-  типа lmstudio: для каждой модели записывается поле `limit.context` (значение
-  сначала ищется в кеше/loaded_instances, иначе используется max_context_length).
-  Также инициализируется `limit.output = 0`, если отсутствует.
+   типа lmstudio: для каждой модели записывается поле `limit.context` (значение
+   сначала ищется в кеше/loaded_instances, иначе используется max_context_length).
+   Также инициализируется `limit.output = 0`, если отсутствует.
+   Capability-поля LM Studio (`reasoning`, tool use, vision) переносятся в
+   совместимые поля моделей opencode.
 
 Пример использования:
   ./scripts/update_lmstudio_models.py
@@ -462,16 +464,53 @@ def extract_token_from_conn(conn: Any) -> Optional[str]:
     return try_extract(conn)
 
 
-def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """Возвращает кортеж двух словарей:
+def extract_opencode_model_metadata(model: Dict[str, Any]) -> Dict[str, Any]:
+    """Return opencode-compatible model capability fields from LM Studio metadata."""
+    metadata: Dict[str, Any] = {}
+    caps = model.get("capabilities")
+    if not isinstance(caps, dict):
+        return metadata
+
+    reasoning = caps.get("reasoning")
+    if isinstance(reasoning, bool):
+        metadata["reasoning"] = reasoning
+    elif isinstance(reasoning, dict):
+        allowed = reasoning.get("allowed_options")
+        if isinstance(allowed, list):
+            metadata["reasoning"] = any(
+                str(option).lower() not in {"off", "none", "disabled", "false"}
+                for option in allowed
+            )
+        else:
+            metadata["reasoning"] = True
+    elif reasoning is not None:
+        metadata["reasoning"] = True
+
+    trained_for_tool_use = caps.get("trained_for_tool_use")
+    if isinstance(trained_for_tool_use, bool):
+        metadata["tool_call"] = trained_for_tool_use
+
+    vision = caps.get("vision")
+    if isinstance(vision, bool):
+        metadata["attachment"] = vision
+        if vision:
+            metadata["modalities"] = {"input": ["text", "image"], "output": ["text"]}
+
+    return metadata
+
+
+def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Dict[str, Any]]]:
+    """Возвращает кортеж трёх словарей:
     - server_models: model_id -> max_context_length (если найдено)
     - loaded_instances: instance_id -> config.context_length
+    - model_metadata: model_id -> opencode-compatible capability fields
     """
     server_models: Dict[str, int] = {}
     loaded_instances: Dict[str, int] = {}
+    model_metadata: Dict[str, Dict[str, Any]] = {}
 
     if not isinstance(resp, dict):
-        return server_models, loaded_instances
+        return server_models, loaded_instances, model_metadata
 
     # models
     models = resp.get("models") or resp.get("available_models") or []
@@ -482,6 +521,9 @@ def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[st
                 max_ctx = v.get("max_context_length") or v.get("max_context") or v.get("context_window") or v.get("context_length")
                 if isinstance(max_ctx, int):
                     server_models[k] = int(max_ctx)
+                metadata = extract_opencode_model_metadata(v)
+                if metadata:
+                    model_metadata[str(k)] = metadata
             else:
                 # unknown structure
                 continue
@@ -501,6 +543,10 @@ def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[st
             )
             if isinstance(max_ctx, int):
                 server_models[str(mid)] = int(max_ctx)
+
+            metadata = extract_opencode_model_metadata(m)
+            if metadata:
+                model_metadata[str(mid)] = metadata
 
             # If the model has loaded_instances listed per-model, collect their context lengths
             per_li = m.get("loaded_instances") or m.get("loaded_models") or []
@@ -549,7 +595,7 @@ def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[st
                 if isinstance(ctx, int) and iid:
                     loaded_instances[str(iid)] = int(ctx)
 
-    return server_models, loaded_instances
+    return server_models, loaded_instances, model_metadata
 
 
 def get_model_id_from_entry(entry: Any) -> Optional[str]:
@@ -613,12 +659,27 @@ def get_context_for_model(
     return None
 
 
+def apply_model_metadata(info: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
+    messages: List[str] = []
+    for key in ("reasoning", "tool_call", "attachment"):
+        if key in metadata and info.get(key) != metadata[key]:
+            info[key] = metadata[key]
+            messages.append(f"{key}={metadata[key]}")
+
+    if "modalities" in metadata and info.get("modalities") != metadata["modalities"]:
+        info["modalities"] = metadata["modalities"]
+        messages.append("modalities updated")
+
+    return messages
+
+
 def update_connection_models(
     conn: Dict[str, Any],
     connection_key: str,
     server_models: Dict[str, int],
     cache: Dict[str, Dict[str, int]],
     loaded_instances: Dict[str, int],
+    model_metadata: Dict[str, Dict[str, Any]],
 ) -> Tuple[bool, List[str]]:
     """Обновляет conn['models'] (или создаёт) и возвращает (changed, messages).
     changed - True если внесены изменения.
@@ -684,33 +745,51 @@ def update_connection_models(
                 changed = True
                 messages.append(f"models[{mid}].limit.output=0")
 
+            metadata_messages = apply_model_metadata(info, model_metadata.get(str(mid), {}))
+            if metadata_messages:
+                changed = True
+                for msg in metadata_messages:
+                    messages.append(f"models[{mid}].{msg}")
+
         # Update existing entries and add missing server models.
         for mid, maxctx in server_models.items():
             ctx = get_context_for_model(connection_key, mid, server_models, cache, loaded_instances)
+            metadata = model_metadata.get(mid, {})
             if mid in models_obj:
                 info = models_obj[mid]
                 if ctx is not None:
                     if not isinstance(info, dict):
                         models_obj[mid] = {"limit": {"context": ctx, "output": 0}}
+                        metadata_messages = apply_model_metadata(models_obj[mid], metadata)
                         changed = True
                         messages.append(f"models[{mid}].limit.context={ctx}")
                         messages.append(f"models[{mid}].limit.output=0")
+                        for msg in metadata_messages:
+                            messages.append(f"models[{mid}].{msg}")
                     else:
                         lim = info.setdefault("limit", {})
                         if lim.get("context") != ctx:
                             lim["context"] = ctx
                             changed = True
                             messages.append(f"models[{mid}].limit.context={ctx}")
+                        metadata_messages = apply_model_metadata(info, metadata)
+                        if metadata_messages:
+                            changed = True
+                            for msg in metadata_messages:
+                                messages.append(f"models[{mid}].{msg}")
             else:
                 entry: Dict[str, Any] = {"id": mid}
                 if ctx is not None:
                     entry["limit"] = {"context": ctx, "output": 0}
                 else:
                     entry["limit"] = {"output": 0}
+                metadata_messages = apply_model_metadata(entry, metadata)
                 models_obj[mid] = entry
                 changed = True
                 messages.append(f"models: add {mid} limit.context={ctx}")
                 messages.append(f"models: add {mid} limit.output=0")
+                for msg in metadata_messages:
+                    messages.append(f"models[{mid}].{msg}")
 
     else:
         # no models defined, create object from server_models
@@ -722,6 +801,7 @@ def update_connection_models(
                 entry["limit"] = {"context": ctx, "output": 0}
             else:
                 entry["limit"] = {"output": 0}
+            apply_model_metadata(entry, model_metadata.get(mid, {}))
             new_models[mid] = entry
         if new_models:
             conn["models"] = new_models
@@ -964,9 +1044,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # даже если нет ответа, выводим текущ состояние и переходим к следующему
                 continue
 
-            server_models, loaded_instances = parse_models_response(resp)
+            server_models, loaded_instances, model_metadata = parse_models_response(resp)
             logging.info("  server models: %s", json.dumps(server_models, ensure_ascii=False, indent=2) if server_models else "{}")
             logging.info("  loaded instances: %s", json.dumps(loaded_instances, ensure_ascii=False, indent=2) if loaded_instances else "{}")
+            logging.info("  model metadata: %s", json.dumps(model_metadata, ensure_ascii=False, indent=2) if model_metadata else "{}")
 
             # If server_models is empty, attempt to extract fallback structure
             if not server_models:
@@ -979,7 +1060,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if mid and isinstance(max_ctx, int):
                                 server_models[str(mid)] = int(max_ctx)
 
-            changed, messages = update_connection_models(conn, connection_key, server_models, cache, loaded_instances)
+            changed, messages = update_connection_models(conn, connection_key, server_models, cache, loaded_instances, model_metadata)
             if changed:
                 total_changed = True
                 for msg in messages:
@@ -1018,6 +1099,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for mid, info in models_obj.items():
                         out_entry = {"id": mid}
                         if isinstance(info, dict):
+                            for key in ("reasoning", "tool_call", "attachment", "modalities"):
+                                if key in info:
+                                    out_entry[key] = info[key]
                             lim = info.get("limit")
                             if isinstance(lim, dict) and isinstance(lim.get("context"), int):
                                 out_entry["limit"] = {
