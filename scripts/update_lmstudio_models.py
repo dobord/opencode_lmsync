@@ -13,7 +13,7 @@ update_lmstudio_models.py
 - Делает запрос GET /api/v1/models к указанному в подключении серверу и
   собирает два набора данных:
   * loaded_instances -> кэшируются значения loaded_instances[i].config.context_length
-    по ключу loaded_instances[i].id (в кеше они привязаны к подключению)
+    по ключу модели (в кеше они привязаны к подключению)
   * models -> у каждой модели берётся max_context_length как запасной вариант
  - Обновляет в конфиге opencode.json список моделей у каждого подключения
    типа lmstudio: для каждой модели записывается поле `limit.context` (значение
@@ -502,7 +502,7 @@ def extract_opencode_model_metadata(model: Dict[str, Any]) -> Dict[str, Any]:
 def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Dict[str, Any]]]:
     """Возвращает кортеж трёх словарей:
     - server_models: model_id -> max_context_length (если найдено)
-    - loaded_instances: instance_id -> config.context_length
+    - loaded_instances: model_id -> config.context_length (для вложенных экземпляров)
     - model_metadata: model_id -> opencode-compatible capability fields
     """
     server_models: Dict[str, int] = {}
@@ -551,25 +551,25 @@ def parse_models_response(resp: Dict[str, Any]) -> Tuple[Dict[str, int], Dict[st
             # If the model has loaded_instances listed per-model, collect their context lengths
             per_li = m.get("loaded_instances") or m.get("loaded_models") or []
             if isinstance(per_li, dict):
-                for k, v in per_li.items():
+                for v in per_li.values():
                     if not isinstance(v, dict):
                         continue
-                    iid = v.get("id") or k
                     cfg = v.get("config") or {}
                     if isinstance(cfg, dict):
                         ctx = cfg.get("context_length") or cfg.get("context")
                         if isinstance(ctx, int):
-                            loaded_instances[str(iid)] = int(ctx)
+                            # Instance IDs may omit a variant suffix (for example,
+                            # @iq4_xs), so retain the owning model's exact key.
+                            loaded_instances[str(mid)] = int(ctx)
             elif isinstance(per_li, list):
                 for v in per_li:
                     if not isinstance(v, dict):
                         continue
-                    iid = v.get("id") or v.get("instance_id") or v.get("name")
                     cfg = v.get("config") or {}
                     if isinstance(cfg, dict):
                         ctx = cfg.get("context_length") or cfg.get("context")
-                        if isinstance(ctx, int) and iid:
-                            loaded_instances[str(iid)] = int(ctx)
+                        if isinstance(ctx, int):
+                            loaded_instances[str(mid)] = int(ctx)
 
     # loaded_instances
     li = resp.get("loaded_instances") or resp.get("loaded_models") or []
