@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -24,6 +25,10 @@ DEFAULT_CACHE_PATH = os.path.expanduser("~/.local/share/opencode/lmstudio_contex
 
 class SyncError(ValueError):
     """An intentionally sanitized message safe for the user-facing log."""
+
+
+class ServerUnavailable(SyncError):
+    """A transport failure, not an HTTP/authentication or response error."""
 
 
 def reject_constant(_):
@@ -161,6 +166,10 @@ def request_models(base_url, token):
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SyncError("LM Studio вернул HTTP %d" % exc.code) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ServerUnavailable("LM Studio недоступен (соединение или тайм-аут)") from exc
     except Exception as exc:
         # Never print exception text: response bodies/URLs may contain credentials.
         raise SyncError("Ошибка запроса метаданных LM Studio") from exc
@@ -355,6 +364,10 @@ def main(argv=None):
     parser.add_argument("--api-key")
     parser.add_argument("--connection-name")
     parser.add_argument("--no-autoload", action="store_true")
+    parser.add_argument("--connection", action="append", default=[], metavar="PROVIDER_ID",
+                        help="Синхронизировать только указанный provider ID (можно повторять)")
+    parser.add_argument("--skip-unavailable", action="store_true",
+                        help="Сохранить доступные подключения, пропуская только сетевые сбои")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s")
     try:
@@ -380,6 +393,12 @@ def main(argv=None):
             if not isinstance(entry, dict) or any(not isinstance(ctx, int) or isinstance(ctx, bool) or ctx <= 0 for ctx in entry.values()):
                 raise SyncError("Некорректная структура кэша контекстов")
         added = None
+        eligible = {key for section in ("provider", "providers") for key, conn in cfg.get(section, {}).items()
+                    if key == "lmstudio" or key.startswith("lmstudio_") or conn.get("type") == "lmstudio"}
+        if set(args.connection) - eligible:
+            raise SyncError("--connection содержит неизвестный LM Studio provider ID")
+        if args.connection and args.add_connection:
+            raise SyncError("--connection нельзя сочетать с --add-connection")
         if args.add_connection:
             url = build_lmstudio_config_base_url(args.add_connection.strip())
             netloc = urllib.parse.urlsplit(url).netloc
@@ -398,11 +417,14 @@ def main(argv=None):
             secret = args.api_key or os.environ.get("LM_API_TOKEN")
             if secret:
                 auth[added] = {"type": "api", "key": secret}
+        synced, skipped = 0, 0
         for section in ("provider", "providers"):
             for key, conn in cfg.get(section, {}).items():
                 if not (key == "lmstudio" or key.startswith("lmstudio_") or conn.get("type") == "lmstudio"):
                     continue
                 if key == added and args.no_autoload:
+                    continue
+                if args.connection and key not in args.connection:
                     continue
                 base_url = get_base_url_from_conn(conn)
                 if not base_url and key == "lmstudio":
@@ -411,9 +433,26 @@ def main(argv=None):
                     raise SyncError("Не задан адрес LM Studio провайдера")
                 token = (extract_token_from_conn(conn) or extract_token_from_auth(auth, conn, base_url, key)
                          or os.environ.get("LM_API_TOKEN"))
-                response = request_models(base_url, token)
-                server, loaded, metadata = parse_models_response(response)
-                update_connection_models(conn, base_url, server, cache, loaded, metadata, native=section == "providers")
+                try:
+                    response = request_models(base_url, token)
+                    server, loaded, metadata = parse_models_response(response)
+                    before_ids = set(conn.get("models", {}))
+                    update_connection_models(conn, base_url, server, cache, loaded, metadata, native=section == "providers")
+                except ServerUnavailable as exc:
+                    if not args.skip_unavailable:
+                        raise SyncError("Подключение %r: %s; запись отменена. Для частичного прохода используйте --skip-unavailable или --connection" % (key, exc)) from exc
+                    skipped += 1
+                    logging.warning("Пропущено недоступное подключение %r; его модели сохранены без изменений", key)
+                    continue
+                except SyncError as exc:
+                    raise SyncError("Подключение %r: %s" % (key, exc)) from exc
+                synced += 1
+                logging.info("Подключение %r: моделей с сервера %d, добавлено %d, загруженных контекстов %d",
+                             key, len(metadata), len(set(conn.get("models", {})) - before_ids), len(loaded))
+        if skipped and not synced:
+            raise SyncError("Все выбранные подключения недоступны; запись отменена")
+        if skipped:
+            logging.warning("Неполная синхронизация: обработано %d, недоступно %d", synced, skipped)
         validate_config(cfg, major)
         changes = [(path, data) for path, data, original in zip(paths, (cfg, auth, cache), originals) if data != original]
         if args.dry_run:

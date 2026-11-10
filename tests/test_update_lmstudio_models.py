@@ -339,6 +339,105 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(sync.main(self.args), 2)
         self.assertEqual(before, self.snapshots())
 
+    def qwen_response(self):
+        return {"models": [
+            {"key": "qwen3.8-27b@iq3_xs", "max_context_length": 262144},
+            {"key": "qwen3.8-27b@iq3_xxs", "max_context_length": 262144,
+             "loaded_instances": [{"id": "qwen3.8-27b@iq3_xxs", "config": {"context_length": 135168}}],
+             "capabilities": {"vision": True, "trained_for_tool_use": True}},
+            {"key": "qwen3.8-27b@iq4_xs", "max_context_length": 262144}]}
+
+    def test_qwen_xxs_sync_survives_offline_second_server_only_when_explicit(self):
+        for native in (False, True):
+            for offline_first in (False, True):
+                with self.subTest(native=native, offline_first=offline_first):
+                    for i in range(3):
+                        self.write(i, {})
+                    section = "providers" if native else "provider"
+                    online = self.provider(native, {"qwen3.8-27b@iq3_xs": {}, "qwen3.8-27b@iq4_xs": {}})
+                    offline = self.provider(native, {"keep": {"limit": {"output": 99}}})
+                    pairs = [("lmstudio_online", online), ("lmstudio_offline", offline)]
+                    if offline_first:
+                        pairs.reverse()
+                    self.write(0, {section: dict(pairs), "model": "unrelated/default"})
+                    self.write(2, {"offline": {"keep": 1234}})
+                    before = self.snapshots()
+                    responses = [self.qwen_response(), sync.ServerUnavailable("offline")]
+                    if offline_first:
+                        responses.reverse()
+                    with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=responses):
+                        self.assertEqual(sync.main(self.args), 2)
+                    self.assertEqual(before, self.snapshots())
+                    with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=responses), self.assertLogs(level="INFO") as logs:
+                        self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 0)
+                    self.assertIn("lmstudio_offline", str(logs.output))
+                    cfg = self.read()
+                    self.assertEqual(cfg[section]["lmstudio_offline"], offline)
+                    self.assertEqual(cfg["model"], "unrelated/default")
+                    models = cfg[section]["lmstudio_online"]["models"]
+                    self.assertEqual(models["qwen3.8-27b@iq3_xxs"]["limit"]["context"], 135168)
+                    self.assertEqual(models["qwen3.8-27b@iq3_xs"]["limit"]["context"], 262144)
+                    self.assertEqual(models["qwen3.8-27b@iq4_xs"]["limit"]["context"], 262144)
+                    self.assertEqual(self.read(2)["offline"], {"keep": 1234})
+                    self.assertEqual(before[1], self.snapshots()[1])
+                    after = self.snapshots()
+                    with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=responses), patch.object(sync.os, "replace") as replace:
+                        self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 0)
+                        replace.assert_not_called()
+                    self.assertEqual(after, self.snapshots())
+
+    def test_skip_unavailable_all_offline_never_writes(self):
+        self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider()}})
+        before = self.snapshots()
+        with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=sync.ServerUnavailable("offline")):
+            self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 2)
+        self.assertEqual(before, self.snapshots())
+
+    def test_skip_unavailable_does_not_skip_invalid_response_or_auth_errors(self):
+        self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider()}})
+        for second in (sync.SyncError("LM Studio вернул HTTP 401"), {"models": [None]}):
+            before = self.snapshots()
+            with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=[RESPONSE, second]):
+                self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 2)
+            self.assertEqual(before, self.snapshots())
+
+    def test_selected_connections_only(self):
+        self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider(), "lmstudio_c": self.provider()}})
+        with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", return_value=RESPONSE) as request:
+            self.assertEqual(sync.main(self.args + ["--connection", "lmstudio_a", "--connection", "lmstudio_c"]), 0)
+            self.assertEqual(request.call_count, 2)
+        providers = self.read()["providers"]
+        self.assertEqual(providers["lmstudio_b"], self.provider())
+        self.assertIn("remote", providers["lmstudio_a"]["models"])
+        self.assertIn("remote", providers["lmstudio_c"]["models"])
+
+    def test_invalid_connection_selection_fails_before_network_or_writes(self):
+        for extra in (["--connection", "typo"], ["--connection", "openai"],
+                      ["--connection", "lmstudio", "--add-connection", "fixture"]):
+            self.write(0, {"providers": {"lmstudio": self.provider(), "openai": {}}})
+            before = self.snapshots()
+            with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models") as request:
+                self.assertEqual(sync.main(self.args + extra), 2)
+                request.assert_not_called()
+            self.assertEqual(before, self.snapshots())
+
+    def test_partial_dry_run_never_writes(self):
+        self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider()}})
+        before = self.snapshots()
+        with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=[RESPONSE, sync.ServerUnavailable("offline")]):
+            self.assertEqual(sync.main(self.args + ["--skip-unavailable", "--dry-run"]), 0)
+        self.assertEqual(before, self.snapshots())
+
+    def test_transport_errors_are_distinct_from_http_and_malformed_json(self):
+        for error in (sync.urllib.error.URLError("PRIVATE"), TimeoutError("PRIVATE"), ConnectionResetError("PRIVATE"),
+                      sync.urllib.error.HTTPError("http://PRIVATE", 401, "PRIVATE", {}, None), ValueError("PRIVATE")):
+            expected = sync.ServerUnavailable if isinstance(error, (sync.urllib.error.URLError, OSError)) and not isinstance(error, sync.urllib.error.HTTPError) else sync.SyncError
+            with self.subTest(error=type(error).__name__), patch.object(sync.urllib.request.OpenerDirector, "open", side_effect=error):
+                with self.assertRaises(sync.SyncError) as caught:
+                    sync.request_models("http://fixture", "PRIVATE")
+                self.assertIs(type(caught.exception), expected)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+
     def test_credential_no_arbitrary_or_host_substring_fallback(self):
         auth = {"openai": {"type": "api", "key": "NEVER"}, "fixture.evil:1234": {"type": "api", "key": "NEVER2"}}
         self.assertIsNone(sync.extract_token_from_auth(auth, {}, "http://fixture:1234", "lmstudio_fixture"))
@@ -456,6 +555,48 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(provider["models"]["remote"]["modelID"], "remote")
         self.assertEqual(provider["models"]["remote"]["limit"]["context"], 4096)
         self.assertNotIn("fixture-key", result.stdout + result.stderr)
+
+    def test_cli_subprocess_partial_sync_with_real_disconnected_server(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(inner):
+                if inner.server.offline:
+                    return  # Close without a response: a real transport error.
+                inner.send_response(200)
+                inner.end_headers()
+                inner.wfile.write(json.dumps(self.qwen_response()).encode())
+
+            def log_message(self, *_):
+                pass
+
+        providers = {}
+        for name, offline in (("lmstudio_online", False), ("lmstudio_offline", True)):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.offline = offline
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join)
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            providers[name] = {"settings": {"baseURL": "http://127.0.0.1:%d/v1" % server.server_port}, "models": {}}
+        self.write(0, {"providers": providers})
+        before = self.snapshots()
+        fake = self.root / ("opencode.cmd" if os.name == "nt" else "opencode")
+        fake.write_text("@echo off\necho 2.0.0\n" if os.name == "nt" else "#!/bin/sh\nprintf '2.0.0\\n'\n", encoding="utf-8")
+        if os.name != "nt":
+            fake.chmod(0o700)
+        command = [sys.executable, str(SCRIPT_PATH), *self.args, "--opencode-bin", str(fake)]
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        strict = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(strict.returncode, 2, strict.stderr)
+        self.assertIn("lmstudio_offline", strict.stderr)
+        self.assertEqual(before, self.snapshots())
+        partial = subprocess.run(command + ["--skip-unavailable"], env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        self.assertIn("lmstudio_offline", partial.stderr)
+        result = self.read()["providers"]
+        self.assertEqual(result["lmstudio_online"]["models"]["qwen3.8-27b@iq3_xxs"]["limit"]["context"], 135168)
+        self.assertEqual(result["lmstudio_offline"], providers["lmstudio_offline"])
+        self.assertEqual(before[1], self.snapshots()[1])
 
 
 if __name__ == "__main__":
