@@ -347,7 +347,7 @@ class SafetyTests(unittest.TestCase):
              "capabilities": {"vision": True, "trained_for_tool_use": True}},
             {"key": "qwen3.8-27b@iq4_xs", "max_context_length": 262144}]}
 
-    def test_qwen_xxs_sync_survives_offline_second_server_only_when_explicit(self):
+    def test_qwen_xxs_sync_skips_offline_server_by_default_but_strict_aborts(self):
         for native in (False, True):
             for offline_first in (False, True):
                 with self.subTest(native=native, offline_first=offline_first):
@@ -366,10 +366,10 @@ class SafetyTests(unittest.TestCase):
                     if offline_first:
                         responses.reverse()
                     with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=responses):
-                        self.assertEqual(sync.main(self.args), 2)
+                        self.assertEqual(sync.main(self.args + ["--strict"]), 2)
                     self.assertEqual(before, self.snapshots())
                     with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=responses), self.assertLogs(level="INFO") as logs:
-                        self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 0)
+                        self.assertEqual(sync.main(self.args), 0)
                     self.assertIn("lmstudio_offline", str(logs.output))
                     cfg = self.read()
                     self.assertEqual(cfg[section]["lmstudio_offline"], offline)
@@ -390,7 +390,17 @@ class SafetyTests(unittest.TestCase):
         self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider()}})
         before = self.snapshots()
         with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=sync.ServerUnavailable("offline")):
-            self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 2)
+            self.assertEqual(sync.main(self.args), 2)
+        self.assertEqual(before, self.snapshots())
+
+    def test_strict_and_skip_unavailable_are_mutually_exclusive(self):
+        before = self.snapshots()
+        for flags in (["--strict", "--skip-unavailable"], ["--skip-unavailable", "--strict"]):
+            with patch.object(sync.sys, "stderr"), patch.object(sync, "detect_opencode_version") as detect:
+                with self.assertRaises(SystemExit) as caught:
+                    sync.main(self.args + flags)
+                self.assertEqual(caught.exception.code, 2)
+                detect.assert_not_called()
         self.assertEqual(before, self.snapshots())
 
     def test_skip_unavailable_does_not_skip_invalid_response_or_auth_errors(self):
@@ -398,7 +408,7 @@ class SafetyTests(unittest.TestCase):
         for second in (sync.SyncError("LM Studio вернул HTTP 401"), {"models": [None]}):
             before = self.snapshots()
             with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=[RESPONSE, second]):
-                self.assertEqual(sync.main(self.args + ["--skip-unavailable"]), 2)
+                self.assertEqual(sync.main(self.args), 2)
             self.assertEqual(before, self.snapshots())
 
     def test_selected_connections_only(self):
@@ -425,7 +435,7 @@ class SafetyTests(unittest.TestCase):
         self.write(0, {"providers": {"lmstudio_a": self.provider(), "lmstudio_b": self.provider()}})
         before = self.snapshots()
         with patch.object(sync, "detect_opencode_version", return_value=2), patch.object(sync, "request_models", side_effect=[RESPONSE, sync.ServerUnavailable("offline")]):
-            self.assertEqual(sync.main(self.args + ["--skip-unavailable", "--dry-run"]), 0)
+            self.assertEqual(sync.main(self.args + ["--dry-run"]), 0)
         self.assertEqual(before, self.snapshots())
 
     def test_transport_errors_are_distinct_from_http_and_malformed_json(self):
@@ -586,11 +596,11 @@ class SafetyTests(unittest.TestCase):
             fake.chmod(0o700)
         command = [sys.executable, str(SCRIPT_PATH), *self.args, "--opencode-bin", str(fake)]
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
-        strict = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        strict = subprocess.run(command + ["--strict"], env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(strict.returncode, 2, strict.stderr)
         self.assertIn("lmstudio_offline", strict.stderr)
         self.assertEqual(before, self.snapshots())
-        partial = subprocess.run(command + ["--skip-unavailable"], env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        partial = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(partial.returncode, 0, partial.stderr)
         self.assertIn("lmstudio_offline", partial.stderr)
         result = self.read()["providers"]

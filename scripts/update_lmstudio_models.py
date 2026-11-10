@@ -366,8 +366,11 @@ def main(argv=None):
     parser.add_argument("--no-autoload", action="store_true")
     parser.add_argument("--connection", action="append", default=[], metavar="PROVIDER_ID",
                         help="Синхронизировать только указанный provider ID (можно повторять)")
-    parser.add_argument("--skip-unavailable", action="store_true",
-                        help="Сохранить доступные подключения, пропуская только сетевые сбои")
+    availability = parser.add_mutually_exclusive_group()
+    availability.add_argument("--skip-unavailable", action="store_true", default=True,
+                              help="Пропускать сетевые сбои отдельных серверов (по умолчанию)")
+    availability.add_argument("--strict", action="store_false", dest="skip_unavailable",
+                              help="Отменить весь проход при недоступности любого выбранного сервера")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s")
     try:
@@ -440,7 +443,7 @@ def main(argv=None):
                     update_connection_models(conn, base_url, server, cache, loaded, metadata, native=section == "providers")
                 except ServerUnavailable as exc:
                     if not args.skip_unavailable:
-                        raise SyncError("Подключение %r: %s; запись отменена. Для частичного прохода используйте --skip-unavailable или --connection" % (key, exc)) from exc
+                        raise SyncError("Подключение %r: %s; запись отменена (--strict). Для частичного прохода уберите --strict или используйте --connection" % (key, exc)) from exc
                     skipped += 1
                     logging.warning("Пропущено недоступное подключение %r; его модели сохранены без изменений", key)
                     continue
