@@ -1,155 +1,142 @@
 # opencode_lmsync
 
-Инструмент для синхронизации конфигурации `opencode` с серверами LM Studio.
+Синхронизация моделей LM Studio с конфигурацией **OpenCode V1 и V2**. Зависимости — только стандартная библиотека Python 3.8+.
 
-Скрипт находит подключения типа `lmstudio` в `opencode.json`, запрашивает у соответствующего сервера доступные модели и записывает для них актуальные лимиты контекста и capabilities. При необходимости он также может добавить новое подключение, обновить `auth.json` и сохранить локальный кэш размеров контекста.
+## Безопасность и совместимость
 
-## Что делает скрипт
+Перед чтением **любого** config/auth/cache скрипт выполняет `opencode --version` с тайм-аутом 10 секунд, без shell. Поддерживаются `1.x.y` и `2.x.y`, включая semver prerelease. Отсутствующий CLI, ошибка запуска или неизвестная версия останавливают работу без записи. Gate обязателен также для `--dry-run` и `--no-autoload`.
 
-- ищет подключения `lmstudio` в конфиге `opencode`;
-- определяет адрес сервера по полям подключения, а также поддерживает `provider.lmstudio`;
-- берёт токен в таком порядке: из самого подключения, из `auth.json` по provider ID или адресу сервера, затем из переменной окружения `LM_API_TOKEN`;
-- делает запрос `GET /api/v1/models` к LM Studio;
-- обновляет для моделей поле `limit.context` и инициализирует `limit.output = 0`;
-- переносит из LM Studio capability-поля в формат opencode: `reasoning`, `tool_call`, `attachment` и `modalities`;
-- предпочитает значение контекста из `loaded_instances`, затем из кэша, затем из `max_context_length` модели;
-- удаляет устаревшие поля контекста и внутренние служебные маркеры перед сохранением;
-- если `opencode.json` отсутствует, начинает с пустой конфигурации и создаёт файл при сохранении.
+**Версия CLI и формат файла независимы:**
 
-## Требования
+| CLI | Существующие записи | Новое подключение |
+| --- | --- | --- |
+| V1 | `provider` / V1 models | `provider`, `npm`, `options` |
+| V2 | V1 сохраняются V1; native V2 сохраняются V2 | `providers`, `package`, `settings` |
 
-- Python 3.8 или новее;
-- доступ к LM Studio серверу по HTTP;
-- при защищённом подключении API-ключ в `auth.json` или в переменной `LM_API_TOKEN`.
+V1 CLI отказывается изменять обнаруженные V2-only настройки. В V2 допустимы обе top-level maps с **разными** IDs; одинаковый ID в `provider` и `providers` вызывает отказ. Вложенное смешение форматов provider/model запрещено: требуется явная миграция. Скрипт не мигрирует весь конфиг и сохраняет посторонние настройки, aliases, variants, выбранную модель и существующий `limit.output`.
 
-Зависимости только стандартной библиотеки Python, дополнительных пакетов не требуется.
+Источники: [миграция V1 → V2](https://opencode.ai/v2/docs/migrate-v1), [providers](https://opencode.ai/v2/docs/providers), [models](https://opencode.ai/v2/docs/models).
 
-## Быстрый старт
+## Запуск
 
-Проверить доступные опции:
+Нужны Python, OpenCode CLI и доступ к LM Studio по HTTP(S).
 
 ```bash
-python3 scripts/update_lmstudio_models.py --help
+python scripts/update_lmstudio_models.py --help
+python scripts/update_lmstudio_models.py --dry-run
+python scripts/update_lmstudio_models.py
 ```
 
-Обновить конфигурацию:
+Для изолированной конфигурации:
 
 ```bash
-python3 scripts/update_lmstudio_models.py
+python scripts/update_lmstudio_models.py \
+  --opencode-bin /path/to/opencode \
+  --config-path ./fixtures/opencode.json \
+  --auth-path ./fixtures/auth.json \
+  --cache-path ./fixtures/cache.json \
+  --dry-run
 ```
 
-Посмотреть, что изменится, без записи файлов:
+## Параметры
 
-```bash
-python3 scripts/update_lmstudio_models.py --dry-run --verbose
-```
-
-## Файлы и пути по умолчанию
-
-| Файл | Назначение |
+| Флаг | Значение |
 | --- | --- |
-| `~/.config/opencode/opencode.json` | Основной конфиг `opencode` |
-| `~/.local/share/opencode/auth.json` | Источник API-ключей |
-| `~/.local/share/opencode/lmstudio_context_cache.json` | Локальный кэш контекстов моделей |
+| `--config-path PATH` | По умолчанию `~/.config/opencode/opencode.json` |
+| `--auth-path PATH` | По умолчанию `~/.local/share/opencode/auth.json` |
+| `--cache-path PATH` | По умолчанию `~/.local/share/opencode/lmstudio_context_cache.json` |
+| `--opencode-bin PATH` | CLI для проверки версии; по умолчанию `opencode` |
+| `--dry-run` | Выполнить чтение и запросы, не записывать ничего |
+| `--verbose` | Подробность логирования; ключи и содержимое моделей не выводятся |
+| `--add-connection HOST[:PORT]` | Добавить провайдер; допускается полный HTTP(S) URL |
+| `--connection-name NAME` | Отображаемое имя нового провайдера |
+| `--api-key KEY` | Ключ нового подключения; сохраняется только в `auth.json` |
+| `--no-autoload` | Не запрашивать модели **нового** подключения; остальные обрабатываются |
 
-Пути можно переопределить флагами `--config-path`, `--auth-path` и `--cache-path`.
-
-## Как это работает
-
-1. Скрипт загружает `opencode.json`, `auth.json` и кэш, если они существуют.
-2. Находит все объекты, похожие на подключения, и выбирает только `lmstudio`.
-3. Для каждого подключения определяет `base_url` и токен.
-4. Запрашивает список моделей у `GET /api/v1/models`.
-5. Для каждой модели пишет или обновляет `limit.context`, `limit.output` и поддерживаемые capabilities.
-6. Если изменился конфиг, кэш или `auth.json`, сохраняет только изменённые файлы.
-
-Для новых подключений есть отдельный режим добавления. В этом режиме скрипт сам формирует человекочитаемое имя, избегает коллизий и записывает API-ключ в `auth.json` под тем же provider ID, который создаётся в `opencode.json`. Это важно для `opencode`: credential ID должен совпадать с ключом в секции `provider`. Старые списки `models` скрипт читает, но перед сохранением нормализует их в объектную форму, которую ожидает `opencode`.
-
-## Параметры CLI
-
-| Флаг | Описание |
-| --- | --- |
-| `--config-path PATH` | Путь к `opencode.json` |
-| `--auth-path PATH` | Путь к `auth.json` |
-| `--cache-path PATH` | Путь к файлу кэша контекстов |
-| `--dry-run` | Не записывать изменения на диск |
-| `--verbose` | Включить подробный лог |
-| `--add-connection HOST[:PORT]` | Добавить новое подключение `lmstudio` по адресу сервера или URL |
-| `--api-key KEY` | Записать ключ для добавляемого подключения в `auth.json` |
-| `--connection-name NAME` | Задать имя нового подключения вручную |
-| `--no-autoload` | При добавлении подключения не запрашивать модели автоматически |
-
-Флаг `--add-connection` принимает адрес без схемы, полный URL или URL с путём. Если порт не указан, используется `1234`.
-
-## Примеры
-
-Добавить локальный LM Studio сервер и сразу обновить конфиг:
+Добавление использует свободный ID `lmstudio_<host_port>` в обеих maps и `auth.json`, не перезаписывая и не переиспользуя существующие credentials. Для адреса без схемы порт по умолчанию — `1234`; полный HTTP(S) URL сохраняет указанный authority (без порта — стандартный порт схемы). Путь по умолчанию — `/v1`.
 
 ```bash
-python3 scripts/update_lmstudio_models.py --add-connection 127.0.0.1:1234
+python scripts/update_lmstudio_models.py --add-connection 127.0.0.1:1234
+python scripts/update_lmstudio_models.py --add-connection gpu.example:1234 --no-autoload
 ```
 
-Добавить удалённый сервер, задать имя и сохранить ключ отдельно:
+`--api-key` может быть виден в списке процессов/истории shell. Предпочитайте `LM_API_TOKEN` или заранее настроенный credential. В конфиге поддерживается `settings.apiKey` / `options.apiKey` с подстановкой `{env:LMSTUDIO_API_KEY}`. Подстановка должна разрешаться в непустое значение; `{file:...}` не поддерживается.
 
-```bash
-python3 scripts/update_lmstudio_models.py \
-	--add-connection http://example.com:1234/v1 \
-	--connection-name "LM Studio Workstation" \
-	--api-key "$LM_API_TOKEN"
-```
+## Форматы
 
-Только создать подключение без автозагрузки моделей:
-
-```bash
-python3 scripts/update_lmstudio_models.py \
-	--add-connection 192.168.1.82 \
-	--no-autoload
-```
-
-Проверить изменения перед записью:
-
-```bash
-LM_API_TOKEN=token_here python3 scripts/update_lmstudio_models.py --dry-run
-```
-
-## Формат обновлений
-
-Для моделей скрипт предпочитает современную схему с `limit`:
+### V1 (сохраняется таким же и под V2 CLI)
 
 ```json
 {
-	"type": "lmstudio",
-	"base_url": "http://127.0.0.1:1234/v1",
-	"models": {
-		"llama-3.1-8b-instruct": {
-			"id": "llama-3.1-8b-instruct",
-			"reasoning": true,
-			"tool_call": true,
-			"limit": {
-				"context": 8192,
-				"output": 0
-			}
-		}
-	}
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "lmstudio_work": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {"baseURL": "http://127.0.0.1:1234/v1"},
+      "models": {
+        "coding": {
+          "id": "remote-model-id",
+          "tool_call": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]},
+          "limit": {"context": 32768, "output": 8192}
+        }
+      }
+    }
+  }
 }
 ```
 
-Если в конфиге встречаются устаревшие поля вроде `context_size` или `context_window`, они удаляются при сохранении, чтобы конфигурация оставалась консистентной.
+### Native V2
 
-## Полезные замечания
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "lmstudio_work/coding",
+  "providers": {
+    "lmstudio_work": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {"baseURL": "http://127.0.0.1:1234/v1"},
+      "models": {
+        "coding": {
+          "modelID": "remote-model-id",
+          "capabilities": {"tools": true, "input": ["text", "image"], "output": ["text"]},
+          "limit": {"context": 32768, "output": 8192}
+        }
+      }
+    }
+  }
+}
+```
 
-- Если сервер LM Studio недоступен или токен не найден, скрипт пропускает подключение и продолжает обработку остальных записей.
-- Для новых подключений внутренний маркер `_added_by_cli` удаляется перед записью в конфиг.
-- Скрипт поддерживает как список моделей, так и словарь моделей в зависимости от структуры конфига.
-- Отдельная секция `provider.lmstudio` тоже обрабатывается.
+Alias `coding` обновляется по `modelID` (V1: `id`), без добавления дублирующей записи remote ID. Все aliases одной модели обновляются. В native V2 скрипт не внедряет V1 `id`, `tool_call`, `modalities`, `reasoning`, `attachment`, provider `type` или служебные маркеры. Native reasoning controls не выводятся из LM Studio: существующие `capabilities.reasoning` сохраняются. В legacy V1 поля reasoning/attachment остаются V1; V2 может игнорировать их согласно migration guide.
 
-## Диагностика
+## Алгоритм
 
-- Если подключение пропускается из-за отсутствия `base_url`, проверьте, что в конфиге есть поле `base_url`, `url`, `host`, `endpoint` или эквивалентная структура в `provider.lmstudio`.
-- Если контексты не обновляются, сначала попробуйте `--verbose` и проверьте ответ `GET /api/v1/models`.
-- Если API-ключ лежит в `auth.json`, для использования самим `opencode` его ключ должен совпадать с ID провайдера из `opencode.json`, например `lmstudio_192_168_1_82_1234`. Старые записи вида `192.168.1.82:1234` скрипт умеет читать и при следующем запуске копирует в provider ID.
-- Если LM Studio отвечает ошибкой про отсутствующий `Authorization: Bearer`, проверьте `opencode providers list`: credential должен быть записан под тем же именем, что и provider в `opencode models`.
+1. Проверить версию CLI; сделать snapshots исходных bytes и modes всех трёх файлов.
+2. Строго прочитать JSON-объекты: отсутствие файла допустимо, повреждение — ошибка до записи. Проверить provider/model maps и структуру кэша.
+3. Найти `lmstudio` / `lmstudio_*` в обеих maps даже без `type`, а также V1 entries с `type: lmstudio`. Рекурсивного поиска в произвольных настройках нет.
+4. Определить endpoint; для `lmstudio` без адреса используется `http://127.0.0.1:1234`. Запросить `GET /api/v1/models` на корне сервера.
+5. Токен: явно заданный в подключении → точный provider ID в auth → точный endpoint/netloc в auth → `LM_API_TOKEN`. Credential другого провайдера, совпадение подстроки или только hostname **не используются**. OAuth credential не используется как API-ключ. HTTP redirects запрещены.
+6. Контекст: точное совпадение в loaded instances → кэш → максимальный серверный контекст. Fuzzy-сопоставления нет; embedding-модели исключаются. `limit.output = 0` добавляется только при отсутствии поля. Известные vision/tool capabilities обновляются; прочие поля сохраняются.
+7. После успешной обработки всех подключений сохранить действительно изменённые файлы. Ошибка запроса/разбора/обработки прерывает проход с ненулевым exit code; частичные in-memory изменения не сохраняются.
 
-## Лицензия
+## Ограничения
 
-Пока не указана. Если вы планируете распространять проект, добавьте отдельный файл лицензии и ссылку на него здесь.
+- Поддерживается **строгий JSON**, не JSONC: комментарии, trailing commas, повторяющиеся ключи, NaN/Infinity вызывают безопасный отказ. Комментарии не удаляются автоматически.
+- Списки `models` и смешанные вложенные формы требуют явной миграции. Проверяется используемая структура, а не вся схема OpenCode.
+- Перед записью повторно проверяются **все три** входных файла (bytes/mode), даже если меняется лишь кэш. Обнаруженное внешнее изменение прекращает запись.
+- Уникальные temporary files в том же каталоге, fsync и atomic replace каждого файла. Существующие permission bits сохраняются; новые файлы получают `0600` на POSIX. На Windows это не гарантия сохранения индивидуальных ACL; их следует контролировать отдельно.
+- Это **не** межфайловая транзакция и **не** устранение TOCTOU. Ошибка/внешнее изменение между отдельными replace может оставить уже заменённый файл; завершение будет неуспешным. Автоматического rollback/backup нет; перед первым применением сохраните резервную копию.
+- Symlink входных файлов запрещён; одинаковые resolved paths и hardlink aliases config/auth/cache отклоняются. При содержательном изменении JSON форматируется заново; неизменённые файлы не переписываются.
+- URL с credentials/query/fragment запрещены. Native API запрашивается от корня хоста; path-prefixed reverse proxy отклоняется до запроса, чтобы не отправить credential в другой path. Для удалённых серверов используйте HTTPS.
+- V2 уже имеет встроенный LM Studio discovery. Этот инструмент нужен для явных overrides/кэша, а не для обязательной настройки V2.
+
+Exit code: `0` — успех/нет изменений/dry-run; `2` — отказ, ошибка обработки или записи.
+
+## Изолированные тесты
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Тесты создают временные config/auth/cache, подставляют version responses и запускают subprocess CLI с fake OpenCode и HTTP fixture на loopback. Реальные пользовательские конфиги и production endpoints не затрагиваются.
